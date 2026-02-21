@@ -270,7 +270,7 @@ def admin_reset():
     if not auth_admin(): return jsonify({"ok":False,"hata":"Yetkisiz"}),403
     onay = (request.json or {}).get("onay","")
     if onay != "SIFIRLA":
-        return jsonify({"ok":False,"hata":"Onay için body'de {"onay":"SIFIRLA"} gönder."})
+        return jsonify({"ok":False,"hata":"Onay icin body'de onay=SIFIRLA gonderin."})
     db_yaz({})
     dev_yaz({})
     with _clk: _cihazlar.clear()
