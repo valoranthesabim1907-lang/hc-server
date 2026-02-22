@@ -549,3 +549,275 @@ def admin_tarama_dosya(tarama_id,dosya):
 if __name__=="__main__":
     port=int(os.environ.get("PORT",5000))
     app.run(host="0.0.0.0",port=port)
+
+# ══════════════════════════════════════════════════════════════
+#  KULLANICI AYARLARI — site_config + hesaplar (Railway'de saklanır)
+#  Her kullanıcı kendi ayarlarını Railway'e yazar/okur.
+#  Böylece exe'nin kurulu olduğu klasöre yazma gerekmez.
+# ══════════════════════════════════════════════════════════════
+
+# Kullanıcı bazlı ayarlar: {kadi: {site_config:{...}, hesaplar:"...", ...}}
+_ayarlar_mem: dict = {}
+_ayarlar_lock = threading.Lock()
+AYARLAR_FILE = TMP / "ayarlar.json"
+
+def ayarlar_oku_tumu() -> dict:
+    with _ayarlar_lock:
+        return dict(_ayarlar_mem)
+
+def ayarlar_yaz_tumu(data: dict):
+    with _ayarlar_lock:
+        _ayarlar_mem.clear()
+        _ayarlar_mem.update(data)
+    try:
+        AYARLAR_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    # Ayrıca users_db içine göm (Railway kalıcı storage)
+    try:
+        db = db_oku()
+        for kadi, ayar in data.items():
+            if kadi in db:
+                db[kadi]["_ayarlar"] = ayar
+        db_yaz(db)
+    except Exception:
+        pass
+
+def ayarlar_oku(kadi: str) -> dict:
+    with _ayarlar_lock:
+        return dict(_ayarlar_mem.get(kadi, {}))
+
+def ayarlar_yaz(kadi: str, ayar: dict):
+    with _ayarlar_lock:
+        _ayarlar_mem[kadi] = ayar
+    # Kalıcı yaz
+    tumu = dict(_ayarlar_mem)
+    try:
+        AYARLAR_FILE.write_text(json.dumps(tumu, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        db = db_oku()
+        if kadi in db:
+            db[kadi]["_ayarlar"] = ayar
+            db_yaz(db)
+    except Exception:
+        pass
+
+def _ayarlar_yukle():
+    """Sunucu başlarken ayarları users_db'den çek."""
+    global _ayarlar_mem
+    try:
+        db = db_oku()
+        for kadi, v in db.items():
+            if "_ayarlar" in v:
+                _ayarlar_mem[kadi] = v["_ayarlar"]
+        if _ayarlar_mem:
+            print(f"[HC] Ayarlar {len(_ayarlar_mem)} kullanıcı için yüklendi.")
+    except Exception:
+        pass
+
+_ayarlar_yukle()
+
+
+# ── KULLANICI AYAR ENDPOINTLERİ ──────────────────────────────
+
+@app.route("/kullanici/site-config", methods=["GET"])
+def kullanici_site_config_get():
+    """Bot, login olduktan sonra kendi site_config'ini çeker."""
+    if not auth_bot():
+        return jsonify({"ok": False, "hata": "Yetkisiz"}), 403
+    kadi = request.args.get("kadi", "").strip().lower()
+    if not kadi:
+        return jsonify({"ok": False, "hata": "kadi gerekli"}), 400
+    ayar = ayarlar_oku(kadi)
+    return jsonify({"ok": True, "config": ayar.get("site_config", {})})
+
+
+@app.route("/kullanici/site-config", methods=["POST"])
+def kullanici_site_config_post():
+    """Bot, site_config'ini Railway'e kaydeder."""
+    if not auth_bot():
+        return jsonify({"ok": False, "hata": "Yetkisiz"}), 403
+    d = request.json or {}
+    kadi = d.get("kadi", "").strip().lower()
+    cfg  = d.get("config", {})
+    if not kadi:
+        return jsonify({"ok": False, "hata": "kadi gerekli"}), 400
+    ayar = ayarlar_oku(kadi)
+    ayar["site_config"] = cfg
+    ayarlar_yaz(kadi, ayar)
+    return jsonify({"ok": True})
+
+
+@app.route("/kullanici/hesaplar", methods=["GET"])
+def kullanici_hesaplar_get():
+    """Bot, hesaplar listesini Railway'den çeker."""
+    if not auth_bot():
+        return jsonify({"ok": False, "hata": "Yetkisiz"}), 403
+    kadi = request.args.get("kadi", "").strip().lower()
+    if not kadi:
+        return jsonify({"ok": False, "hata": "kadi gerekli"}), 400
+    ayar = ayarlar_oku(kadi)
+    icerik = ayar.get("hesaplar", "")
+    satirlar = [l for l in icerik.splitlines() if l.strip() and ":" in l]
+    return jsonify({"ok": True, "icerik": icerik, "adet": len(satirlar)})
+
+
+@app.route("/kullanici/hesaplar", methods=["POST"])
+def kullanici_hesaplar_post():
+    """Bot, hesaplar listesini Railway'e kaydeder."""
+    if not auth_bot():
+        return jsonify({"ok": False, "hata": "Yetkisiz"}), 403
+    d = request.json or {}
+    kadi   = d.get("kadi", "").strip().lower()
+    icerik = d.get("icerik", "")
+    if not kadi:
+        return jsonify({"ok": False, "hata": "kadi gerekli"}), 400
+    ayar = ayarlar_oku(kadi)
+    ayar["hesaplar"] = icerik
+    ayarlar_yaz(kadi, ayar)
+    adet = len([l for l in icerik.splitlines() if l.strip() and ":" in l])
+    return jsonify({"ok": True, "adet": adet})
+
+
+@app.route("/kullanici/basarili", methods=["GET"])
+def kullanici_basarili_get():
+    """Bot, başarılı sonuçları Railway'den okur (anlık)."""
+    if not auth_bot():
+        return jsonify({"ok": False, "hata": "Yetkisiz"}), 403
+    kadi = request.args.get("kadi", "").strip().lower()
+    ayar = ayarlar_oku(kadi)
+    return jsonify({"ok": True, "icerik": ayar.get("basarili", "")})
+
+
+@app.route("/kullanici/basarili", methods=["POST"])
+def kullanici_basarili_post():
+    """Bot, başarılı sonuçları Railway'e ekler (append)."""
+    if not auth_bot():
+        return jsonify({"ok": False, "hata": "Yetkisiz"}), 403
+    d = request.json or {}
+    kadi   = d.get("kadi", "").strip().lower()
+    satir  = d.get("satir", "")
+    mod    = d.get("mod", "append")  # "append" | "clear"
+    ayar   = ayarlar_oku(kadi)
+    if mod == "clear":
+        ayar["basarili"] = ""
+    else:
+        mevcut = ayar.get("basarili", "")
+        ayar["basarili"] = (mevcut + "\n" + satir).strip()
+    ayarlar_yaz(kadi, ayar)
+    return jsonify({"ok": True})
+
+
+@app.route("/kullanici/hatali", methods=["GET"])
+def kullanici_hatali_get():
+    if not auth_bot():
+        return jsonify({"ok": False, "hata": "Yetkisiz"}), 403
+    kadi = request.args.get("kadi", "").strip().lower()
+    ayar = ayarlar_oku(kadi)
+    return jsonify({"ok": True, "icerik": ayar.get("hatali", "")})
+
+
+@app.route("/kullanici/hatali", methods=["POST"])
+def kullanici_hatali_post():
+    if not auth_bot():
+        return jsonify({"ok": False, "hata": "Yetkisiz"}), 403
+    d = request.json or {}
+    kadi  = d.get("kadi", "").strip().lower()
+    satir = d.get("satir", "")
+    mod   = d.get("mod", "append")
+    ayar  = ayarlar_oku(kadi)
+    if mod == "clear":
+        ayar["hatali"] = ""
+    else:
+        mevcut = ayar.get("hatali", "")
+        ayar["hatali"] = (mevcut + "\n" + satir).strip()
+    ayarlar_yaz(kadi, ayar)
+    return jsonify({"ok": True})
+
+
+@app.route("/kullanici/bos", methods=["GET"])
+def kullanici_bos_get():
+    if not auth_bot():
+        return jsonify({"ok": False, "hata": "Yetkisiz"}), 403
+    kadi = request.args.get("kadi", "").strip().lower()
+    ayar = ayarlar_oku(kadi)
+    return jsonify({"ok": True, "icerik": ayar.get("bos", "")})
+
+
+@app.route("/kullanici/bos", methods=["POST"])
+def kullanici_bos_post():
+    if not auth_bot():
+        return jsonify({"ok": False, "hata": "Yetkisiz"}), 403
+    d = request.json or {}
+    kadi  = d.get("kadi", "").strip().lower()
+    satir = d.get("satir", "")
+    mod   = d.get("mod", "append")
+    ayar  = ayarlar_oku(kadi)
+    if mod == "clear":
+        ayar["bos"] = ""
+    else:
+        mevcut = ayar.get("bos", "")
+        ayar["bos"] = (mevcut + "\n" + satir).strip()
+    ayarlar_yaz(kadi, ayar)
+    return jsonify({"ok": True})
+
+
+@app.route("/kullanici/temizle", methods=["POST"])
+def kullanici_temizle():
+    """Başarılı/hatalı/boş listelerini sıfırla."""
+    if not auth_bot():
+        return jsonify({"ok": False, "hata": "Yetkisiz"}), 403
+    d = request.json or {}
+    kadi    = d.get("kadi", "").strip().lower()
+    dosyalar = d.get("dosyalar", ["basarili", "hatali", "bos"])
+    ayar    = ayarlar_oku(kadi)
+    for k in dosyalar:
+        ayar[k] = ""
+    ayarlar_yaz(kadi, ayar)
+    return jsonify({"ok": True})
+
+
+# ── ADMIN: Kullanıcı ayarlarını görme ────────────────────────
+
+@app.route("/admin/kullanici/ayarlar")
+def admin_kullanici_ayarlar():
+    """Admin, belirli bir kullanıcının tüm ayarlarını görebilir."""
+    if not auth_admin():
+        return jsonify({"ok": False, "hata": "Yetkisiz"}), 403
+    kadi = request.args.get("kadi", "").strip().lower()
+    if not kadi:
+        # Tüm kullanıcıların özeti
+        tumu = ayarlar_oku_tumu()
+        ozet = {}
+        for k, v in tumu.items():
+            ozet[k] = {
+                "site_config": v.get("site_config", {}),
+                "hesap_sayisi": len([l for l in v.get("hesaplar","").splitlines() if ":" in l]),
+                "basarili_sayisi": len([l for l in v.get("basarili","").splitlines() if l.strip()]),
+                "hatali_sayisi": len([l for l in v.get("hatali","").splitlines() if l.strip()]),
+            }
+        return jsonify({"ok": True, "ayarlar": ozet})
+    ayar = ayarlar_oku(kadi)
+    return jsonify({"ok": True, "kadi": kadi, "ayar": ayar})
+
+
+@app.route("/admin/kullanici/basarili")
+def admin_kullanici_basarili():
+    """Admin, kullanıcının başarılı listesini indirir."""
+    if not auth_admin():
+        return jsonify({"ok": False, "hata": "Yetkisiz"}), 403
+    kadi = request.args.get("kadi", "").strip().lower()
+    ayar = ayarlar_oku(kadi)
+    return jsonify({"ok": True, "kadi": kadi, "icerik": ayar.get("basarili", "")})
+
+
+@app.route("/admin/kullanici/hatali")
+def admin_kullanici_hatali():
+    """Admin, kullanıcının hatalı listesini indirir."""
+    if not auth_admin():
+        return jsonify({"ok": False, "hata": "Yetkisiz"}), 403
+    kadi = request.args.get("kadi", "").strip().lower()
+    ayar = ayarlar_oku(kadi)
+    return jsonify({"ok": True, "kadi": kadi, "icerik": ayar.get("hatali", "")})
