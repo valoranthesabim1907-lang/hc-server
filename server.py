@@ -39,29 +39,52 @@ TARAMA_FILES.mkdir(parents=True, exist_ok=True)
 _lock = threading.Lock()
 _clk  = threading.Lock()
 
-# ── KULLANICI DB (BELLEK + ENV VAR) ──────────────────────────
-_users_mem: dict = {}   # Ana bellek içi kullanıcı veritabanı
-_users_lock = threading.Lock()
+# ── KULLANICI DB (DOSYA TABANLI + BELLEK CACHE) ──────────────
+# Sorun: Railway birden fazla worker açarsa her biri farklı bellek görür.
+# Çözüm: /tmp/users_db.json PRIMARY storage, bellek sadece hız için cache.
+# Her db_oku() son yazılan dosyayı kontrol eder (mtime ile).
+# db_yaz() önce dosyaya yazar (atomic), sonra env var'a arka planda.
+
+_users_mem: dict  = {}
+_users_lock       = threading.Lock()
+_users_db_path    = TMP / "users_db.json"
+_users_last_mtime : float = 0.0  # Son okunan dosyanın mtime'ı
 
 def _encode_db(data: dict) -> str:
-    """dict → base64(gzip(json))"""
     raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
     return base64.b64encode(gzip.compress(raw)).decode("ascii")
 
 def _decode_db(s: str) -> dict:
-    """base64(gzip(json)) → dict"""
     try:
         return json.loads(gzip.decompress(base64.b64decode(s)).decode("utf-8"))
     except Exception:
         return {}
 
-def _railway_env_guncelle(deger: str) -> bool:
-    """
-    HC_USERS_DB env var'ını Railway GraphQL API ile günceller.
-    RAILWAY_TOKEN set edilmemişse sessizce geçer.
-    """
+def _dosyadan_oku() -> dict:
+    """Dosyadan okur, parse eder, hata varsa {} döner."""
+    try:
+        if _users_db_path.exists():
+            return json.loads(_users_db_path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+def _dosyaya_yaz_atomic(data: dict):
+    """Geçici dosyaya yaz, sonra rename et — atomic işlem."""
+    tmp_path = _users_db_path.with_suffix(".tmp")
+    try:
+        tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(_users_db_path)
+    except Exception:
+        try:
+            _users_db_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+def _railway_env_guncelle(encoded: str):
+    """Railway env var'ı arka planda günceller (yedek kalıcı depo)."""
     if not RAILWAY_TOKEN or not RAILWAY_PROJECT_ID or not RAILWAY_SERVICE_ID:
-        return False
+        return
     try:
         env_id = RAILWAY_ENVIRONMENT_ID or "production"
         mutation = """
@@ -77,7 +100,7 @@ def _railway_env_guncelle(deger: str) -> bool:
                     "environmentId": env_id,
                     "serviceId":     RAILWAY_SERVICE_ID,
                     "name":          "HC_USERS_DB",
-                    "value":         deger
+                    "value":         encoded
                 }
             }
         }).encode("utf-8")
@@ -87,87 +110,90 @@ def _railway_env_guncelle(deger: str) -> bool:
         req = urllib.request.Request(
             "https://backboard.railway.app/graphql/v2",
             data    = payload,
-            headers = {
-                "Content-Type":  "application/json",
-                "Authorization": f"Bearer {RAILWAY_TOKEN}"
-            },
+            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {RAILWAY_TOKEN}"},
             method  = "POST"
         )
-        urllib.request.urlopen(req, timeout=10, context=ctx)
-        return True
+        urllib.request.urlopen(req, timeout=15, context=ctx)
     except Exception:
-        return False
-
-def _env_guncelle_async(encoded: str):
-    """Railway API çağrısını arka planda yapar — request'i bloke etmez."""
-    t = threading.Thread(target=_railway_env_guncelle, args=(encoded,), daemon=True)
-    t.start()
+        pass
 
 def db_oku() -> dict:
-    """Bellek içi kullanıcı DB'sini döndürür."""
-    with _users_lock:
-        return dict(_users_mem)
+    """
+    Kullanıcı DB'sini döndürür.
+    Dosya değişmişse (mtime farklıysa) yeniden okur — worker arası senkron.
+    """
+    global _users_last_mtime
+    try:
+        mtime = _users_db_path.stat().st_mtime if _users_db_path.exists() else 0.0
+        with _users_lock:
+            if mtime != _users_last_mtime:
+                # Dosya değişmiş — yeniden yükle
+                data = _dosyadan_oku()
+                if data or mtime > 0:
+                    _users_mem.clear()
+                    _users_mem.update(data)
+                    _users_last_mtime = mtime
+            return dict(_users_mem)
+    except Exception:
+        with _users_lock:
+            return dict(_users_mem)
 
 def db_yaz(data: dict):
     """
-    Kullanıcı DB'sini günceller:
-    1. Bellek içi dict güncellenir (anlık)
-    2. /tmp cache dosyasına yazılır (restart'a kadar)
-    3. Railway env var güncellenir arka planda (kalıcı)
+    1. Önce /tmp dosyasına atomic yazar (tüm workerlar görsün)
+    2. Belleği günceller
+    3. Railway env var'ı arka planda günceller (kalıcılık için)
     """
+    global _users_last_mtime
+    # 1. Dosyaya yaz (atomic)
+    _dosyaya_yaz_atomic(data)
+    # 2. Belleği güncelle
     with _users_lock:
         _users_mem.clear()
         _users_mem.update(data)
-    # /tmp cache
-    try:
-        (TMP / "users_db.json").write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-    except Exception:
-        pass
-    # Railway env var — arka planda
+        try:
+            _users_last_mtime = _users_db_path.stat().st_mtime
+        except Exception:
+            pass
+    # 3. Railway env var — arka planda (kalıcılık için, yavaş olabilir)
     try:
         encoded = _encode_db(data)
-        _env_guncelle_async(encoded)
+        t = threading.Thread(target=_railway_env_guncelle, args=(encoded,), daemon=True)
+        t.start()
     except Exception:
         pass
 
 def _db_yukle():
-    """
-    Sunucu başlarken kullanıcı DB'sini yükler.
-    Öncelik sırası:
-      1. HC_USERS_DB env var (Railway'de kalıcı)
-      2. /tmp/users_db.json (önceki oturumdan cache, aynı container ise)
-      3. Boş dict (ilk çalışma)
-    """
-    global _users_mem
-
-    # 1. Env var
+    """Sunucu başlangıcında DB'yi yükler. /tmp > env var sırası."""
+    global _users_last_mtime
+    # 1. /tmp dosyası (aynı container restart — en güncel)
+    if _users_db_path.exists():
+        try:
+            data = _dosyadan_oku()
+            if data:
+                print(f"[HC] DB /tmp'den yüklendi: {len(data)} kullanıcı")
+                with _users_lock:
+                    _users_mem.update(data)
+                    _users_last_mtime = _users_db_path.stat().st_mtime
+                return
+        except Exception:
+            pass
+    # 2. Env var (farklı container / ilk deploy)
     encoded = os.environ.get("HC_USERS_DB", "")
     if encoded:
         data = _decode_db(encoded)
         if data:
-            print(f"[HC] Kullanıcı DB env var'dan yüklendi: {len(data)} kullanıcı")
+            print(f"[HC] DB env var'dan yüklendi: {len(data)} kullanıcı")
+            _dosyaya_yaz_atomic(data)
             with _users_lock:
-                _users_mem = data
+                _users_mem.update(data)
+                try:
+                    _users_last_mtime = _users_db_path.stat().st_mtime
+                except Exception:
+                    pass
             return
+    print("[HC] DB boş başlatıldı.")
 
-    # 2. /tmp cache
-    cache = TMP / "users_db.json"
-    if cache.exists():
-        try:
-            data = json.loads(cache.read_text(encoding="utf-8"))
-            if data:
-                print(f"[HC] Kullanıcı DB /tmp cache'den yüklendi: {len(data)} kullanıcı")
-                with _users_lock:
-                    _users_mem = data
-                return
-        except Exception:
-            pass
-
-    print("[HC] Kullanıcı DB boş başlatıldı.")
-
-# Sunucu başlangıcında yükle
 _db_yukle()
 
 # ── GEÇİCİ DOSYA (cihaz/tarama) ──────────────────────────────
@@ -288,7 +314,7 @@ def kayit():
     if not re.match(r"^[a-zA-Z0-9_]{4,20}$",kadi):
         return jsonify({"ok":False,"hata":"Kullanıcı adı 4-20 karakter, harf/rakam/alt çizgi olmalı."})
     if len(sifre)<6: return jsonify({"ok":False,"hata":"Şifre en az 6 karakter olmalı."})
-    db=db_oku()
+    db=db_oku()  # Kayıt için tek okuma yeterli
     if kadi in db: return jsonify({"ok":False,"hata":"Bu kullanıcı adı alınmış."})
     for k,v in list(db.items()):
         if mac and mac in v.get("macler",[]):
@@ -309,7 +335,12 @@ def giris():
     if not auth_bot(): return jsonify({"ok":False,"hata":"Yetkisiz"}),403
     d=request.json or {}
     kadi=d.get("kadi","").strip().lower(); sifre=d.get("sifre","").strip(); mac=d.get("mac","").strip()
-    db=db_oku()
+    # Retry: dosya henüz senkron olmamış olabilir, 3 deneme yap
+    db={}
+    for _attempt in range(3):
+        db=db_oku()
+        if kadi in db: break
+        if _attempt < 2: import time; time.sleep(0.3)
     if kadi not in db: return jsonify({"ok":False,"hata":"Kullanıcı bulunamadı."})
     u=db[kadi]
     if u["pw"]!=shash(sifre): return jsonify({"ok":False,"hata":"Şifre hatalı."})
