@@ -1,7 +1,10 @@
 """
 HostingControl — Merkezi Sunucu (Railway)
+Depolama: Kullanıcılar Railway env var'da (HC_USERS_DB) tutulur.
+          Railway restart etse bile veri kaybolmaz.
+          Cihaz/tarama verileri /tmp'de tutulur (geçici, restart'ta sıfırlanır — önemli değil).
 """
-import os, json, hashlib, threading, uuid, re
+import os, json, hashlib, threading, uuid, re, base64, gzip, urllib.request, ssl
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from flask import Flask, jsonify, request
@@ -13,42 +16,182 @@ CORS(app)
 HC_SECRET   = os.environ.get("HC_SECRET",   "hc_gizli_anahtar_degistir")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", HC_SECRET)
 
-DATA_PATH = Path(os.environ.get("DATA_PATH", "/data"))
-DATA_PATH.mkdir(parents=True, exist_ok=True)
+# ── RAILWAY ENV VAR DEPOLAMA ──────────────────────────────────
+# Kullanıcı DB'si Railway env var'da tutulur → restart'tan etkilenmez.
+# Gerekli Railway env var'ları (Railway otomatik inject eder):
+#   RAILWAY_PROJECT_ID, RAILWAY_ENVIRONMENT_ID, RAILWAY_SERVICE_ID
+# Kullanıcının elle eklemesi gereken tek şey:
+#   RAILWAY_TOKEN = Railway dashboard → Account Settings → Tokens
 
-USERS_FILE   = DATA_PATH / "users_db.json"
-DEVICES_FILE = DATA_PATH / "devices_db.json"
-TARAMA_FILE  = DATA_PATH / "taramalar.json"
-TARAMA_FILES = DATA_PATH / "tarama_dosyalar"
+RAILWAY_TOKEN          = os.environ.get("RAILWAY_TOKEN", "")
+RAILWAY_PROJECT_ID     = os.environ.get("RAILWAY_PROJECT_ID", "")
+RAILWAY_ENVIRONMENT_ID = os.environ.get("RAILWAY_ENVIRONMENT_ID", "")
+RAILWAY_SERVICE_ID     = os.environ.get("RAILWAY_SERVICE_ID", "")
+
+# Geçici dosya cache (restart'a kadar geçerli)
+TMP = Path("/tmp/hc")
+TMP.mkdir(parents=True, exist_ok=True)
+DEVICES_FILE = TMP / "devices_db.json"
+TARAMA_FILE  = TMP / "taramalar.json"
+TARAMA_FILES = TMP / "tarama_dosyalar"
 TARAMA_FILES.mkdir(parents=True, exist_ok=True)
 
 _lock = threading.Lock()
 _clk  = threading.Lock()
-_cihazlar = {}
 
-def shash(s): return hashlib.sha256(s.encode()).hexdigest()
+# ── KULLANICI DB (BELLEK + ENV VAR) ──────────────────────────
+_users_mem: dict = {}   # Ana bellek içi kullanıcı veritabanı
+_users_lock = threading.Lock()
 
-def oku(path):
+def _encode_db(data: dict) -> str:
+    """dict → base64(gzip(json))"""
+    raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return base64.b64encode(gzip.compress(raw)).decode("ascii")
+
+def _decode_db(s: str) -> dict:
+    """base64(gzip(json)) → dict"""
+    try:
+        return json.loads(gzip.decompress(base64.b64decode(s)).decode("utf-8"))
+    except Exception:
+        return {}
+
+def _railway_env_guncelle(deger: str) -> bool:
+    """
+    HC_USERS_DB env var'ını Railway GraphQL API ile günceller.
+    RAILWAY_TOKEN set edilmemişse sessizce geçer.
+    """
+    if not RAILWAY_TOKEN or not RAILWAY_PROJECT_ID or not RAILWAY_SERVICE_ID:
+        return False
+    try:
+        env_id = RAILWAY_ENVIRONMENT_ID or "production"
+        mutation = """
+        mutation VarUpsert($input: VariableUpsertInput!) {
+            variableUpsert(input: $input)
+        }
+        """
+        payload = json.dumps({
+            "query": mutation,
+            "variables": {
+                "input": {
+                    "projectId":     RAILWAY_PROJECT_ID,
+                    "environmentId": env_id,
+                    "serviceId":     RAILWAY_SERVICE_ID,
+                    "name":          "HC_USERS_DB",
+                    "value":         deger
+                }
+            }
+        }).encode("utf-8")
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+        req = urllib.request.Request(
+            "https://backboard.railway.app/graphql/v2",
+            data    = payload,
+            headers = {
+                "Content-Type":  "application/json",
+                "Authorization": f"Bearer {RAILWAY_TOKEN}"
+            },
+            method  = "POST"
+        )
+        urllib.request.urlopen(req, timeout=10, context=ctx)
+        return True
+    except Exception:
+        return False
+
+def _env_guncelle_async(encoded: str):
+    """Railway API çağrısını arka planda yapar — request'i bloke etmez."""
+    t = threading.Thread(target=_railway_env_guncelle, args=(encoded,), daemon=True)
+    t.start()
+
+def db_oku() -> dict:
+    """Bellek içi kullanıcı DB'sini döndürür."""
+    with _users_lock:
+        return dict(_users_mem)
+
+def db_yaz(data: dict):
+    """
+    Kullanıcı DB'sini günceller:
+    1. Bellek içi dict güncellenir (anlık)
+    2. /tmp cache dosyasına yazılır (restart'a kadar)
+    3. Railway env var güncellenir arka planda (kalıcı)
+    """
+    with _users_lock:
+        _users_mem.clear()
+        _users_mem.update(data)
+    # /tmp cache
+    try:
+        (TMP / "users_db.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
+    # Railway env var — arka planda
+    try:
+        encoded = _encode_db(data)
+        _env_guncelle_async(encoded)
+    except Exception:
+        pass
+
+def _db_yukle():
+    """
+    Sunucu başlarken kullanıcı DB'sini yükler.
+    Öncelik sırası:
+      1. HC_USERS_DB env var (Railway'de kalıcı)
+      2. /tmp/users_db.json (önceki oturumdan cache, aynı container ise)
+      3. Boş dict (ilk çalışma)
+    """
+    global _users_mem
+
+    # 1. Env var
+    encoded = os.environ.get("HC_USERS_DB", "")
+    if encoded:
+        data = _decode_db(encoded)
+        if data:
+            print(f"[HC] Kullanıcı DB env var'dan yüklendi: {len(data)} kullanıcı")
+            with _users_lock:
+                _users_mem = data
+            return
+
+    # 2. /tmp cache
+    cache = TMP / "users_db.json"
+    if cache.exists():
+        try:
+            data = json.loads(cache.read_text(encoding="utf-8"))
+            if data:
+                print(f"[HC] Kullanıcı DB /tmp cache'den yüklendi: {len(data)} kullanıcı")
+                with _users_lock:
+                    _users_mem = data
+                return
+        except Exception:
+            pass
+
+    print("[HC] Kullanıcı DB boş başlatıldı.")
+
+# Sunucu başlangıcında yükle
+_db_yukle()
+
+# ── GEÇİCİ DOSYA (cihaz/tarama) ──────────────────────────────
+def _oku(path):
     try:
         if path.exists(): return json.loads(path.read_text(encoding="utf-8"))
     except: pass
     return {}
 
-def yaz(path, data):
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+def _yaz(path, data):
+    try: path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except: pass
 
-def db_oku():
-    with _lock: return oku(USERS_FILE)
-def db_yaz(d):
-    with _lock: yaz(USERS_FILE, d)
 def dev_oku():
-    with _lock: return oku(DEVICES_FILE)
+    with _lock: return _oku(DEVICES_FILE)
 def dev_yaz(d):
-    with _lock: yaz(DEVICES_FILE, d)
+    with _lock: _yaz(DEVICES_FILE, d)
 def tarama_oku():
-    with _lock: return oku(TARAMA_FILE)
+    with _lock: return _oku(TARAMA_FILE)
 def tarama_yaz(d):
-    with _lock: yaz(TARAMA_FILE, d)
+    with _lock: _yaz(TARAMA_FILE, d)
+
+# ── YARDIMCILAR ──────────────────────────────────────────────
+def shash(s): return hashlib.sha256(s.encode()).hexdigest()
 
 def auth_bot():
     s = request.headers.get("X-HC-Secret") or request.args.get("secret","")
@@ -87,6 +230,8 @@ def time_left(exp):
     if m: parts.append(f"{m}d")
     return " ".join(parts) or "<1d"
 
+_cihazlar = {}
+
 def cihaz_al(mac):
     with _clk:
         if mac not in _cihazlar:
@@ -106,15 +251,18 @@ def _cihaz_kaydet_db(mac, kadi, info):
                   "calisma_sayisi":1,"kullanicilar":[kadi] if kadi else [],"engellendi":False}
     dev_yaz(dev)
 
-# ── GENEL ───────────────────────────────────────────────────
+# ── GENEL ────────────────────────────────────────────────────
 @app.route("/ping")
 def ping():
     secret_ok = HC_SECRET != "hc_gizli_anahtar_degistir"
+    railway_ok = bool(RAILWAY_TOKEN and RAILWAY_PROJECT_ID)
     return jsonify({
-        "ok"        : True,
-        "zaman"     : datetime.now().isoformat(),
-        "secret_set": secret_ok,
-        "secret_bas": HC_SECRET[:4] + "***" if secret_ok else "AYARLANMAMIS"
+        "ok"         : True,
+        "zaman"      : datetime.now().isoformat(),
+        "secret_set" : secret_ok,
+        "railway_ok" : railway_ok,
+        "kullanici_say": len(db_oku()),
+        "secret_bas" : HC_SECRET[:4] + "***" if secret_ok else "AYARLANMAMIS"
     })
 
 @app.route("/debug")
@@ -123,9 +271,14 @@ def debug():
     db=db_oku(); dev=dev_oku()
     with _clk:
         botlar={mac:{"hostname":v["hostname"],"kullanici":v["kullanici"],"son_gorulme":v["son_gorulme"]} for mac,v in _cihazlar.items()}
-    return jsonify({"ok":True,"kullanici_sayisi":len(db),"cihaz_sayisi":len(dev),"online_bot":len(botlar),"botlar":botlar})
+    return jsonify({
+        "ok":True,"kullanici_sayisi":len(db),"cihaz_sayisi":len(dev),
+        "online_bot":len(botlar),"botlar":botlar,
+        "railway_token_set": bool(RAILWAY_TOKEN),
+        "railway_project_id": RAILWAY_PROJECT_ID[:8]+"..." if RAILWAY_PROJECT_ID else "YOK",
+    })
 
-# ── AUTH ─────────────────────────────────────────────────────
+# ── AUTH ──────────────────────────────────────────────────────
 @app.route("/auth/kayit", methods=["POST"])
 def kayit():
     if not auth_bot(): return jsonify({"ok":False,"hata":"Yetkisiz"}),403
@@ -139,11 +292,9 @@ def kayit():
     if kadi in db: return jsonify({"ok":False,"hata":"Bu kullanıcı adı alınmış."})
     for k,v in list(db.items()):
         if mac and mac in v.get("macler",[]):
-            # MAC bu kullanıcıya ait — onaylı ve aktifse engelle
             if v.get("approved") and not v.get("locked"):
                 return jsonify({"ok":False,"hata":"Bu cihazdan zaten kayıt yapılmış."})
             else:
-                # Onaysız veya kilitli hesap — o hesabı sil, yeniden kayda izin ver
                 del db[k]
                 db_yaz(db)
                 break
@@ -195,7 +346,7 @@ def profil(kadi):
                     "expires":u.get("expires",""),"max_dev":u.get("max_dev",1),
                     "cihaz_say":len(u.get("macler",[])),"approved":u.get("approved"),"locked":u.get("locked")})
 
-# ── ADMIN KULLANICI ──────────────────────────────────────────
+# ── ADMIN KULLANICI ───────────────────────────────────────────
 @app.route("/admin/kullanicilar")
 def admin_kullanicilar():
     if not auth_admin(): return jsonify({"ok":False,"hata":"Yetkisiz"}),403
@@ -246,40 +397,31 @@ def admin_sil():
     if not auth_admin(): return jsonify({"ok":False,"hata":"Yetkisiz"}),403
     kadi=(request.json or {}).get("kadi","").lower(); db=db_oku()
     if kadi in db:
-        # Kullanıcının MAC'lerini devices_db'den de temizle ki tekrar kayıt olabilsin
         kullanici_macleri = db[kadi].get("macler", [])
         if kullanici_macleri:
             dev = dev_oku()
             for mac in kullanici_macleri:
-                if mac in dev:
-                    del dev[mac]
+                if mac in dev: del dev[mac]
             dev_yaz(dev)
-            # Bellek içi _cihazlar'dan da kaldır
             with _clk:
-                for mac in kullanici_macleri:
-                    _cihazlar.pop(mac, None)
+                for mac in kullanici_macleri: _cihazlar.pop(mac, None)
         del db[kadi]
         db_yaz(db)
     return jsonify({"ok":True})
 
-
-# ── ADMIN RESET ──────────────────────────────────────────────
 @app.route("/admin/reset", methods=["POST"])
 def admin_reset():
-    """Tüm kullanıcı ve cihaz verisini sıfırlar. DİKKATLİ KULLAN!"""
     if not auth_admin(): return jsonify({"ok":False,"hata":"Yetkisiz"}),403
     onay = (request.json or {}).get("onay","")
     if onay != "SIFIRLA":
-        return jsonify({"ok":False,"hata":"Onay icin body'de onay=SIFIRLA gonderin."})
+        return jsonify({"ok":False,"hata":"Onay için body'de onay=SIFIRLA gönderin."})
     db_yaz({})
     dev_yaz({})
     with _clk: _cihazlar.clear()
     return jsonify({"ok":True,"mesaj":"Tüm kullanıcı ve cihaz verisi silindi."})
 
-# ── ADMIN MAC TEMİZLE ─────────────────────────────────────────
 @app.route("/admin/mac-temizle", methods=["POST"])
 def admin_mac_temizle():
-    """Belirli bir MAC adresini tüm kayıtlardan temizler."""
     if not auth_admin(): return jsonify({"ok":False,"hata":"Yetkisiz"}),403
     mac = (request.json or {}).get("mac","").strip()
     if not mac: return jsonify({"ok":False,"hata":"mac gerekli"})
@@ -293,7 +435,7 @@ def admin_mac_temizle():
     with _clk: _cihazlar.pop(mac, None)
     return jsonify({"ok":True,"temizlenen_kullanicilar":temizlenen})
 
-# ── ADMIN CİHAZ ─────────────────────────────────────────────
+# ── ADMIN CİHAZ ──────────────────────────────────────────────
 @app.route("/admin/cihazlar")
 def admin_cihazlar():
     if not auth_admin(): return jsonify({"ok":False,"hata":"Yetkisiz"}),403
@@ -314,7 +456,7 @@ def admin_cihaz_sil():
     if mac in dev: del dev[mac]; dev_yaz(dev)
     return jsonify({"ok":True})
 
-# ── KOMUT ───────────────────────────────────────────────────
+# ── KOMUT ─────────────────────────────────────────────────────
 @app.route("/komut/bekle/<mac>", methods=["GET","POST"])
 def komut_bekle(mac):
     if not auth_bot(): return jsonify({"ok":False,"hata":"Yetkisiz"}),403
@@ -366,7 +508,7 @@ def komut_liste():
                 "son_gorulme":v["son_gorulme"],"bekleyen":len(v["komutlar"])} for mac,v in _cihazlar.items()]
     return jsonify({"ok":True,"cihazlar":liste})
 
-# ── TARAMA SONUÇLARI ─────────────────────────────────────────
+# ── TARAMA SONUÇLARI ──────────────────────────────────────────
 @app.route("/tarama/sonuc", methods=["POST"])
 def tarama_sonuc():
     if not auth_bot(): return jsonify({"ok":False,"hata":"Yetkisiz"}),403
@@ -374,40 +516,24 @@ def tarama_sonuc():
     mac=d.get("mac",""); kadi=d.get("kadi","?")
     tarih=d.get("tarih",datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     tid=str(uuid.uuid4())[:8]
-
-    kayit={
-        "id"      : tid,
-        "mac"     : mac,
-        "kadi"    : kadi,
-        "hedef"   : d.get("hedef",""),
-        "site_adi": d.get("site_adi",""),
-        "tarih"   : tarih,
-        "toplam"  : d.get("toplam",0),
-        "basarili": d.get("basarili",0),
-        "hatali"  : d.get("hatali",0),
-        "bos"     : d.get("bos",0),
-    }
-
-    # Her txt'i ayrı dosyaya kaydet
+    kayit={"id":tid,"mac":mac,"kadi":kadi,"hedef":d.get("hedef",""),"site_adi":d.get("site_adi",""),
+           "tarih":tarih,"toplam":d.get("toplam",0),"basarili":d.get("basarili",0),
+           "hatali":d.get("hatali",0),"bos":d.get("bos",0)}
     klasor = TARAMA_FILES / tid
     klasor.mkdir(parents=True, exist_ok=True)
     for alan,dosya in [("basarili_txt","basarili.txt"),("hatali_txt","hatali.txt"),("bos_txt","bos.txt")]:
         icerik=d.get(alan,"")
-        if icerik:
-            (klasor/dosya).write_text(icerik, encoding="utf-8")
-
+        if icerik: (klasor/dosya).write_text(icerik, encoding="utf-8")
     db=tarama_oku()
     if kadi not in db: db[kadi]=[]
-    db[kadi].insert(0,kayit)
-    db[kadi]=db[kadi][:100]
+    db[kadi].insert(0,kayit); db[kadi]=db[kadi][:100]
     tarama_yaz(db)
     return jsonify({"ok":True,"id":tid})
 
 @app.route("/admin/taramalar")
 def admin_taramalar():
     if not auth_admin(): return jsonify({"ok":False,"hata":"Yetkisiz"}),403
-    kadi=request.args.get("kadi","")
-    db=tarama_oku()
+    kadi=request.args.get("kadi",""); db=tarama_oku()
     if kadi: return jsonify({"ok":True,"taramalar":{kadi:db.get(kadi,[])}})
     return jsonify({"ok":True,"taramalar":db})
 
