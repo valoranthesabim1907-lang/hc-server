@@ -138,11 +138,12 @@ def db_oku() -> dict:
         with _users_lock:
             return dict(_users_mem)
 
-def db_yaz(data: dict):
+def db_yaz(data: dict, kritik: bool = True):
     """
-    1. Önce /tmp dosyasına atomic yazar (tüm workerlar görsün)
+    1. /tmp dosyasına atomic yazar
     2. Belleği günceller
-    3. Railway env var'ı arka planda günceller (kalıcılık için)
+    3. kritik=True  → Railway env var SYNC günceller (kayıt/onay/silme gibi)
+       kritik=False → async günceller (aktif/cikis gibi önemsiz yazmalarda)
     """
     global _users_last_mtime
     # 1. Dosyaya yaz (atomic)
@@ -155,11 +156,14 @@ def db_yaz(data: dict):
             _users_last_mtime = _users_db_path.stat().st_mtime
         except Exception:
             pass
-    # 3. Railway env var — arka planda (kalıcılık için, yavaş olabilir)
+    # 3. Railway env var
     try:
         encoded = _encode_db(data)
-        t = threading.Thread(target=_railway_env_guncelle, args=(encoded,), daemon=True)
-        t.start()
+        if kritik:
+            _railway_env_guncelle(encoded)  # sync — veri kaybolmaz
+        else:
+            t = threading.Thread(target=_railway_env_guncelle, args=(encoded,), daemon=True)
+            t.start()
     except Exception:
         pass
 
@@ -353,7 +357,7 @@ def giris():
         db[kadi]["macler"].append(mac)
     if mac and mac not in db[kadi].get("active",[]):
         db[kadi].setdefault("active",[]).append(mac)
-    db_yaz(db)
+    db_yaz(db, kritik=False)  # sadece active[] güncelleniyor
     if mac: _cihaz_kaydet_db(mac,kadi,d)
     return jsonify({"ok":True,"kadi":kadi,"site":u.get("site",""),"sure":time_left(u.get("expires")),
                     "max_dev":max_dev,"cihaz_say":len(db[kadi].get("macler",[])),"expires":u.get("expires","")})
@@ -365,7 +369,7 @@ def cikis():
     db=db_oku()
     if kadi in db and mac:
         aktif=db[kadi].get("active",[])
-        if mac in aktif: aktif.remove(mac); db[kadi]["active"]=aktif; db_yaz(db)
+        if mac in aktif: aktif.remove(mac); db[kadi]["active"]=aktif; db_yaz(db, kritik=False)
     return jsonify({"ok":True})
 
 @app.route("/auth/profil/<kadi>")
