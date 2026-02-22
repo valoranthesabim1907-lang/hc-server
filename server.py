@@ -298,7 +298,7 @@ def kayit():
                 del db[k]
                 db_yaz(db)
                 break
-    db[kadi]={"pw":shash(sifre),"pw_plain":sifre,"approved":False,"max_dev":1,"expires":None,
+    db[kadi]={"pw":shash(sifre),"pw_plain":sifre,"approved":False,"max_dev":3,"expires":None,
                "active":[],"macler":[mac] if mac else [],"locked":False,"site":site,"reg_date":datetime.now().isoformat()}
     db_yaz(db)
     if mac: _cihaz_kaydet_db(mac,kadi,d)
@@ -356,7 +356,7 @@ def admin_kullanicilar():
 def admin_onayla():
     if not auth_admin(): return jsonify({"ok":False,"hata":"Yetkisiz"}),403
     d=request.json or {}; kadi=d.get("kadi","").lower()
-    max_dev=int(d.get("max_dev",1)); gun=int(d.get("gun",30))
+    max_dev=int(d.get("max_dev",3)); gun=int(d.get("gun",30))
     db=db_oku()
     if kadi not in db: return jsonify({"ok":False,"hata":"Bulunamadı."})
     db[kadi]["approved"]=True; db[kadi]["max_dev"]=max_dev
